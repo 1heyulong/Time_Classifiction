@@ -21,7 +21,7 @@ from torchmetrics.classification import MulticlassF1Score, BinaryF1Score
 
 from dataloader import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D, Inception_Block_V1
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 
 
 class ICB(L.LightningModule):
@@ -147,7 +147,7 @@ class Adaptive_Spectral_Block(nn.Module):
         return x
 
 
-class TSLANet_layer(L.LightningModule):
+class TSLANet_layer(nn.Module):
     def __init__(self, dim, mlp_ratio=3., drop=0., drop_path=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -171,7 +171,7 @@ class TSLANet_layer(L.LightningModule):
         return x
 
 
-class Statis_layer(L.LightningModule):
+class Statis_layer(nn.Module):
     def __init__(self):
         super().__init__()
         # (1)定义使用变量
@@ -250,7 +250,7 @@ class Statis_layer(L.LightningModule):
         return x4
 
 
-class TSLANet(L.LightningModule):
+class TSLANet(nn.Module):
     def __init__(self):
         super().__init__()
         # 分割切块
@@ -262,13 +262,13 @@ class TSLANet(L.LightningModule):
 
         # 位置编码\正则化
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, args.emb_dim), requires_grad=True)
-        self.pos_drop = nn.Dropout(p=args.dropout_rate)
+        self.pos_drop = nn.Dropout(p=args.dropout)
 
 
         # 构建多层的TSLANet函数
-        dpr = [x.item() for x in torch.linspace(0, args.dropout_rate, args.depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, args.dropout, args.depth)]  # stochastic depth decay rule
         self.tsla_blocks = nn.ModuleList([
-            TSLANet_layer(dim=args.emb_dim, drop=args.dropout_rate, drop_path=dpr[i])
+            TSLANet_layer(dim=args.emb_dim, drop=args.dropout, drop_path=dpr[i])
             for i in range(args.depth)]
         )
 
@@ -313,10 +313,7 @@ class TSLANet(L.LightningModule):
             x = x.mean(1)
             x = self.head(x)
 
-        elif args.module == 'CNN':
-            pass
-
-        elif args.module == 'TSLA+Statis':
+        elif args.module == 'TSLA_Statis':
             x_statis = self.statis_layer(x)
 
             x = self.patch_embed(x)
@@ -329,46 +326,7 @@ class TSLANet(L.LightningModule):
             x = self.head(x) + self.head2(x_statis)
 
         else:
-            raise ValueError("Invalid module type. Choose from 'Statis', 'TSLA', 'TSLA+Statis', 'other'.")
-        """
-        # 统计特征的组件
-        x_statis = self.statis_layer(x)
-        x = self.head2(x_statis)
-        """
-
-        """
-        # TSLANet的组件
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        for tsla_blk in self.tsla_blocks:
-            x = tsla_blk(x)
-        x = x.mean(1)
-        x = self.head(x)
-        """
-        """
-        # x = self.patch_embed(x)
-        # x = x + self.pos_embed
-        # x = self.pos_drop(x)
-        # print(x.shape)
-        for Times_Block in self.Times_Block:
-            x = Times_Block(x)
-        # print(x.shape)
-        x = x.mean(1)
-        # print(x.shape,'llllll')
-        x = x.unsqueeze(1)
-        # x = self.head3(x)
-        """
-        
-        """        
-        x = self.patch_embed(x)
-        # print('qqqqqqqqqqqq',x.shape)# torch.Size([64, 343, 128])
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-        # print('qqqqqqqqqqqq',x.shape)# torch.Size([64, 343, 128])
-        x = self.VAEmodel(x)
-        """
+            raise ValueError("Invalid module type. Choose from 'Statis', 'TSLA', 'TSLA_Statis', 'other'.")
 
         return x
     
@@ -378,27 +336,20 @@ class TSLANet(L.LightningModule):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_id', type=str, default='TEST')
-    parser.add_argument('--data_path', type=str, default=r'data/hhar')
-    parser.add_argument('--start', type=str2bool, default=False)
-    parser.add_argument('--name', type=str, default='描述模型使用')
-    
-    # Training parameters:
-    parser.add_argument('--num_epochs', type=int, default=100)
-    parser.add_argument('--pretrain_epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--train_lr', type=float, default=1e-3)
-    parser.add_argument('--pretrain_lr', type=float, default=1e-3)
+    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/dataset_rate0.2/')
+    parser.add_argument('--start', type=str2bool, default=False, help='用于控制学习率调整函数使用')
+    parser.add_argument('--name', type=str, default='描述模型')
+    parser.add_argument('--batch_size', type=int, default=64)
 
     # Model parameters:
+    parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--emb_dim', type=int, default=128)
-    parser.add_argument('--depth', type=int, default=2)
-    parser.add_argument('--masking_ratio', type=float, default=0.4)
-    parser.add_argument('--dropout_rate', type=float, default=0.15)
-    parser.add_argument('--patch_size', type=int, default=8)
+    parser.add_argument('--depth', type=int, default=2, help="控制神经网络深度")
+    parser.add_argument('--dropout', type=float, default=0.15)
+    parser.add_argument('--patch_size', type=int, default=7, help="时间序列切割的窗口大小")
+    parser.add_argument('--module', type=str, default='TSLA_Statis', help="选择模型模块: 'Statis', 'TSLA', 'TSLA_Statis'")
 
-    # TSLANet components:
-    parser.add_argument('--load_from_pretrained', type=str2bool, default=True, help='False: without pretraining')
+    # TSLANet_layer components:
     parser.add_argument('--ICB', type=str2bool, default=True)
     parser.add_argument('--ASB', type=str2bool, default=True)
     parser.add_argument('--adaptive_filter', type=str2bool, default=True)
@@ -409,13 +360,11 @@ if __name__ == '__main__':
     print(DATASET_PATH)
 
     # load from checkpoint
-    run_description = f"{os.path.basename(args.data_path)}_dim{args.emb_dim}_depth{args.depth}___"
-    run_description += f"ASB_{args.ASB}__AF_{args.adaptive_filter}__ICB_{args.ICB}__preTr_{args.load_from_pretrained}_"
-    run_description += f"{datetime.datetime.now().strftime('%H_%M_%S')}"
+    run_description = f"model{args.module}_data{args.data_path}"
+    run_description += f"_time{datetime.datetime.now().strftime('%H_%M')}_{args.name}"
     print(f"========== {run_description} ===========")
-    run_description = f"{args.name}"
-
-    CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{run_description}"
+    
+    CHECKPOINT_PATH = f"/hy-tmp/store_result/time_0530/{run_description}"
 
     # Ensure that all operations are deterministic on GPU (if used) for reproducibility
     torch.backends.cudnn.deterministic = True
@@ -431,9 +380,8 @@ if __name__ == '__main__':
     args.seq_len = train_loader.dataset.x_data.shape[-1]
     args.num_channels = train_loader.dataset.x_data.shape[1]
 
-
     model = TSLANet().to('cuda')
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)#定义优化器
+    optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)#定义优化器
     if args.start:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True, min_lr=1e-6)
     else:
@@ -443,7 +391,7 @@ if __name__ == '__main__':
 
     # 训练、验证和测试逻辑
     best_val_loss = float('inf')
-    best_model_path = f"/TSLANet/Classification/storept/best_model_{args.name}.pth"
+    best_model_path = f"/hy-tmp/store_pt/{args.module}_best_model_time_{datetime.datetime.now().strftime('%H_%M')}.pt"
    
     # 初始化 TensorBoardLogger
     tensorboard_logger = TensorBoardLogger(
@@ -462,8 +410,6 @@ if __name__ == '__main__':
 
         model.train()
         train_loss = 0.0
-        # train_f1 = 0.0
-        # train_acc = 0.0
         train_preds, train_labels = [], []
 
         for batch_idx, (x, y) in enumerate(train_loader):
@@ -479,14 +425,10 @@ if __name__ == '__main__':
             preds = (output > 0.5).float()
             train_preds.extend(preds.cpu().numpy())
             train_labels.extend(y.cpu().numpy())
-            # train_f1 += train_f1_metric(preds, y.unsqueeze(1)).item()
-            # train_acc += train_acc_metric(preds, y.unsqueeze(1)).item()
 
         avg_train_loss = train_loss / len(train_loader)
-        train_f1 = f1_score(train_labels, train_preds, average='weighted')
+        train_f1 = f1_score(train_labels, train_preds)
         train_acc = accuracy_score(train_labels, train_preds)  # 使用 sklearn 计算 Accuracy
-        # avg_train_f1 = train_f1 / len(train_loader)
-        # avg_train_acc = train_acc / len(train_loader)
         current_lr = optimizer.param_groups[0]['lr']
 
         # 记录训练指标到 TensorBoard
@@ -500,9 +442,6 @@ if __name__ == '__main__':
 
         model.eval()
         val_loss = 0.0
-        val_f1 = 0.0
-        val_acc = 0.0
-
         with torch.no_grad():
             val_preds, val_labels = [], []
             for x, y in val_loader:
@@ -518,11 +457,8 @@ if __name__ == '__main__':
                 val_labels.extend(y.cpu().numpy())
 
         avg_val_loss = val_loss / len(val_loader)
-        avg_val_f1 = f1_score(val_labels, val_preds, average='weighted')  # 使用 sklearn 计算 F1
+        avg_val_f1 = f1_score(val_labels, val_preds)  # 使用 sklearn 计算 F1
         avg_val_acc = accuracy_score(val_labels, val_preds)  # 使用 sklearn 计算 Accuracy
-        # avg_val_f1 = val_f1 / len(val_loader)
-        # avg_val_acc = val_acc / len(val_loader)
-
 
         # 记录验证指标到 TensorBoard
         tensorboard_logger.experiment.add_scalar("Loss/Validation", avg_val_loss, epoch)
@@ -531,11 +467,8 @@ if __name__ == '__main__':
 
         print(f"Validation Loss: {avg_val_loss:.4f}, Validation F1: {avg_val_f1:.4f}, Validation Accuracy: {avg_val_acc:.4f}")
 
-        # # print(f"Epoch {epoch}: Validation Loss: {avg_val_loss:.4f}")
-        # print(f"Epoch {epoch}: Validation Loss: {avg_val_loss:.4f}, Validation F1: {avg_val_f1:.4f}")
-
         # 动态调整学习率
-        scheduler.step(avg_val_loss)
+        scheduler.step()
 
         # 保存验证损失最小的模型
         if avg_val_loss < best_val_loss:
@@ -543,7 +476,6 @@ if __name__ == '__main__':
             torch.save(model.state_dict(), best_model_path)
             print(f"新的模型的验证损失: {best_val_loss:.4f}")
 
-        
     # 测试阶段
     model.load_state_dict(torch.load(best_model_path))
     model.eval()
@@ -569,18 +501,18 @@ if __name__ == '__main__':
     avg_test_loss = test_loss / len(test_loader)
     print(f"Test Loss: {avg_test_loss:.4f}")
 
-    # 计算测试集指标
-
-
+    # 计算测试集指标 ACC, F1, Precision, Recall, cm
     test_acc = accuracy_score(test_labels, test_preds)
-    test_f1 = f1_score(test_labels, test_preds, average='weighted')
-    test_precision = precision_score(test_labels, test_preds, average='weighted')
-    test_recall = recall_score(test_labels, test_preds, average='weighted')
+    test_f1 = f1_score(test_labels, test_preds)
+    test_precision = precision_score(test_labels, test_preds)
+    test_recall = recall_score(test_labels, test_preds)
+    cm = confusion_matrix(test_labels, test_preds)
 
     print(f"Test Accuracy: {test_acc:.4f}")
     print(f"Test F1 Score: {test_f1:.4f}")
     print(f"Test Precision: {test_precision:.4f}")
     print(f"Test Recall: {test_recall:.4f}")
+    print(f"Confusion Matrix:\n{cm}")
 
     # 保存测试结果到文本文件
     results_dir = "/TSLANet/Classification/result_log"
@@ -588,11 +520,12 @@ if __name__ == '__main__':
     results_file = os.path.join(results_dir, "result_log.txt")
 
     with open(results_file, "a") as f:
-        f.write(f"每次实验之前, 需要自己想想怎么描述实验结果:{args.name}\n")
-        f.write(f"Test Accuracy: {test_acc:.4f}\n")
-        f.write(f"Test F1 Score: {test_f1:.4f}\n")
-        f.write(f"Test Precision: {test_precision:.4f}\n")
-        f.write(f"Test Recall: {test_recall:.4f}\n")
+        f.write(f"模型描述_{run_description}\n")
+        f.write(f"Test Accuracy: {test_acc:.4f}")
+        f.write(f"Test F1 Score: {test_f1:.4f}")
+        f.write(f"Test Precision: {test_precision:.4f}")
+        f.write(f"Test Recall: {test_recall:.4f}")
+        f.write(f"Confusion Matrix:\n{cm}\n")
         f.write("\n")
         f.write("\n")
 

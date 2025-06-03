@@ -218,7 +218,9 @@ class model_pretraining(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.pretrain_lr, weight_decay=1e-4)
-        return optimizer
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def _calculate_loss(self, batch, mode="train"):
         data = batch[0]
@@ -260,7 +262,10 @@ class model_training(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
-        return optimizer
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+        
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
 
     def _calculate_loss(self, batch, mode="train"):
         data = batch[0]
@@ -300,6 +305,7 @@ class model_training(L.LightningModule):
             # 生成混淆矩阵
             cm = confusion_matrix(test_targets.numpy(), test_preds.numpy())
             print("Confusion Matrix:\n", cm)
+
 
 def pretrain_model():
     PRETRAIN_MAX_EPOCHS = args.pretrain_epochs
@@ -375,8 +381,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_id', type=str, default='TEST')
-    parser.add_argument('--data_path', type=str, default=r'data/hhar')
-    parser.add_argument('--name', type=str, default='随机测试专用')
+    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/dataset_rate0.2')
+    parser.add_argument('--name', type=str, default='T_0602文件随机测试专用')
     
     # Training parameters:
     parser.add_argument('--num_epochs', type=int, default=100)
@@ -408,7 +414,7 @@ if __name__ == '__main__':
     run_description += f"ASB_{args.ASB}__AF_{args.adaptive_filter}__ICB_{args.ICB}__preTr_{args.load_from_pretrained}_"
     run_description += f"{datetime.datetime.now().strftime('%H_%M_%S')}"
     print(f"========== {run_description} ===========")
-    run_description = f"实验描述{args.name}"
+    run_description = f"test描述0602{args.name}"
 
     CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{args.name}"
     pretrain_checkpoint_callback = ModelCheckpoint(
@@ -459,6 +465,14 @@ if __name__ == '__main__':
     f.write(run_description + "  \n")
     f.write(f"TSLANet_{os.path.basename(args.data_path)}_l_{args.depth}" + "  \n")
     f.write('acc:{}, mf1:{}'.format(acc_results, f1_results))
-    f.write('\n')
+    # 保存混淆矩阵
+    if hasattr(model, 'test_preds') and hasattr(model, 'test_targets'):
+        test_preds = torch.cat(model.test_preds)
+        test_targets = torch.cat(model.test_targets)
+        cm = confusion_matrix(test_targets.numpy(), test_preds.numpy())
+        f.write("Confusion Matrix:\n")
+        f.write(np.array2string(cm))
+        f.write('\n')
+
     f.write('\n')
     f.close()
