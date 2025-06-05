@@ -12,17 +12,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix
+from torchmetrics import ConfusionMatrix
 
 from timm.loss import LabelSmoothingCrossEntropy
-from timm.models.layers import DropPath
-from timm.models.layers import trunc_normal_
+from timm.layers import DropPath, trunc_normal_
 from torchmetrics.classification import MulticlassF1Score
 
 from dataloader import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
 
-
-
+from torchmetrics.classification import BinaryPrecision, BinaryRecall, BinaryAUROC, BinaryAccuracy, BinaryF1Score
 
 
 class ICB(L.LightningModule):
@@ -370,13 +369,20 @@ class model_training(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = TSLANet()
-
-        self.f1 = MulticlassF1Score(num_classes=args.num_classes)
+        self.confmat = ConfusionMatrix(task="binary", num_classes=args.num_classes).to(self.device)
+        
         # self.fc = nn.Linear(2, 1)  # 输出形状(N,1)
         if args.criterion == 'cross_entropy':
             self.criterion = LabelSmoothingCrossEntropy()
+            self.f1 = MulticlassF1Score(num_classes=args.num_classes)
         elif args.criterion == 'bce':
             self.criterion = nn.BCEWithLogitsLoss()
+            self.acc = BinaryAccuracy()
+            self.f1 = BinaryF1Score()
+            self.precision = BinaryPrecision()
+            self.recall = BinaryRecall()
+            self.auroc = BinaryAUROC()
+
         # 用于储存测试集得预测和真实标签
         self.test_preds = []
         self.test_targets = []
@@ -405,15 +411,23 @@ class model_training(L.LightningModule):
             # change_preds = self.fc(preds)
             # 计算部分：
             loss = self.criterion(preds.squeeze(1), labels.float())  # 形状(N,) vs (N,)
-            probs = torch.sigmoid(preds)  # 形状(N,1)
-            pred_labels = (probs > 0.5).long().squeeze(1)
-            acc = (pred_labels == labels).float().mean()
+            pred_labels = (torch.sigmoid(preds) > 0.3).long().squeeze(1)
+            acc = self.acc(pred_labels, labels)
             f1 = self.f1(pred_labels, labels)
+            precision = self.precision(pred_labels, labels)
+            recall = self.recall(pred_labels, labels)
+            auroc = self.auroc(torch.sigmoid(preds), labels)
+
 
         # Logging for both step and epoch
         self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.log(f"{mode}_f1", f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{mode}_precision", precision, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{mode}_recall", recall, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{mode}_auroc", auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+       
+       
         if mode == "test":
             self.test_preds.append(preds.argmax(dim=-1).cpu())
             self.test_targets.append(labels.cpu())
@@ -433,12 +447,13 @@ class model_training(L.LightningModule):
     def on_test_epoch_end(self):
         # 在所有测试批次完成后，生成混淆矩阵
         if len(self.test_preds) > 0:
-            test_preds = torch.cat(self.test_preds)
-            test_targets = torch.cat(self.test_targets)
+            device = next(self.model.parameters()).device
+            targets = torch.cat(self.test_targets).to(device)
+            preds = torch.cat(self.test_preds).to(device)
             
             # 生成混淆矩阵
-            cm = confusion_matrix(test_targets.numpy(), test_preds.numpy())
-            print("Confusion Matrix:\n", cm)
+            cm = self.confmat(targets, preds)
+            print(f"\nConfusion Matrix (device={device}):\n", cm.cpu().numpy())
 
 
 def pretrain_model():
@@ -505,10 +520,14 @@ def train_model(pretrained_model_path):
 
     acc_result = {"test": test_result[0]["test_acc"], "val": val_result[0]["test_acc"]}
     f1_result = {"test": test_result[0]["test_f1"], "val": val_result[0]["test_f1"]}
+    precision_result = {"test": test_result[0]["test_precision"],"val": val_result[0]["test_precision"]}
+    recall_result = {"test": test_result[0]["test_recall"],"val": val_result[0]["test_recall"]}
+    auroc_result = {"test": test_result[0]["test_auroc"],"val": val_result[0]["test_auroc"]}
+
 
     get_clf_report(model, test_loader, CHECKPOINT_PATH, args.class_names)
 
-    return model, acc_result, f1_result
+    return model, acc_result, f1_result, precision_result, recall_result, auroc_result
 
 
 if __name__ == '__main__':
@@ -531,8 +550,8 @@ if __name__ == '__main__':
     parser.add_argument('--emb_dim', type=int, default=128)
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--masking_ratio', type=float, default=0.4)
-    parser.add_argument('--dropout_rate', type=float, default=0.15)
-    parser.add_argument('--patch_size', type=int, default=8)
+    parser.add_argument('--dropout_rate', type=float, default=0.3)# 0.15
+    parser.add_argument('--patch_size', type=int, default=7)
 
     # TSLANet components:
     parser.add_argument('--load_from_pretrained', type=str2bool, default=True, help='False: without pretraining')
@@ -591,9 +610,12 @@ if __name__ == '__main__':
     else:
         best_model_path = ''
 
-    model, acc_results, f1_results = train_model(best_model_path)
-    print("ACC results", acc_results)
-    print("F1  results", f1_results)
+    model, acc_result, f1_result, precision_result, recall_result, auroc_result = train_model(best_model_path)
+    print("ACC results", acc_result)
+    print("F1  results", f1_result)
+    print("Precision results", precision_result)
+    print("Recall results", recall_result)
+    print("AUROC results", auroc_result)
 
     # append result to a text file...
     text_save_dir = "/TSLANet/Classification/textFiles"
@@ -601,7 +623,7 @@ if __name__ == '__main__':
     f = open(f"{text_save_dir}/{args.model_id}.txt", 'a')
     f.write(run_description + "  \n")
     f.write(f"TSLANet_{os.path.basename(args.data_path)}_l_{args.depth}" + "  \n")
-    f.write('acc:{}, mf1:{}'.format(acc_results, f1_results))
+    f.write('acc:{}, mf1:{}, pre:{}, reca:{}, auroc:{}'.format(acc_result, f1_result, precision_result, recall_result, auroc_result))
     # 保存混淆矩阵
     if hasattr(model, 'test_preds') and hasattr(model, 'test_targets'):
         test_preds = torch.cat(model.test_preds)

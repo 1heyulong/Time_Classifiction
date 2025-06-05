@@ -5,19 +5,23 @@ import os
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
-from sklearn.metrics import confusion_matrix
+
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import confusion_matrix
+from torchmetrics import ConfusionMatrix
 
 from timm.loss import LabelSmoothingCrossEntropy
-from timm.models.layers import DropPath
-from timm.models.layers import trunc_normal_
+from timm.layers import DropPath, trunc_normal_
 from torchmetrics.classification import MulticlassF1Score
 
 from dataloader import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
+
+from torchmetrics.classification import BinaryPrecision, BinaryRecall, BinaryAUROC, BinaryAccuracy, BinaryF1Score
 
 
 class ICB(L.LightningModule):
@@ -107,15 +111,12 @@ class Adaptive_Spectral_Block(nn.Module):
             x_masked = x_fft * freq_mask.to(x.device)
 
             weight_high = torch.view_as_complex(self.complex_weight_high)
-            x_weighted2 = x_masked * weight_high
-
-            x_weighted += x_weighted2
+            x_weighted += x_masked * weight_high
 
         # Apply Inverse FFT
         x = torch.fft.irfft(x_weighted, n=N, dim=1, norm='ortho')
 
-        x = x.to(dtype)
-        x = x.view(B, N, C)  # Reshape back to original shape
+        x = x.to(dtype).view(B, N, C)
 
         return x
 
@@ -144,6 +145,109 @@ class TSLANet_layer(L.LightningModule):
         return x
 
 
+def Sliding_window(x, window_size, step_size):
+    """
+    实现滑动窗口操作。
+    :param x: 输入张量，形状为 (batch_size, channels, seq_len)
+    :param window_size: 窗口大小
+    :param step_size: 滑动步长
+    :return: 滑动窗口后的张量，形状为 (batch_size, num_windows, window_size)
+    """
+    batch_size, channels, seq_len = x.shape
+    # 计算可以生成的完整窗口数量
+    num_windows = (seq_len - window_size) // step_size + 1
+
+    # 初始化存储窗口的列表
+    windows = []
+
+    # 提取每个窗口
+    for i in range(0, num_windows * step_size, step_size):
+        windows.append(x[:, :, i:i + window_size].unsqueeze(2))  # 提取窗口并添加维度
+
+    # 合并窗口，形状为 (batch_size, channels, num_windows, window_size)
+    return torch.cat(windows, dim=2)
+
+
+class Statis_layer(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        # (1)定义使用变量
+        # (num, 1, seq_len) -> (num, num_patches, patch_size)
+        stride = args.patch_size // 2
+        num_patches = (args.seq_len - args.patch_size) // stride + 1
+
+        self.num_patches = num_patches
+
+        # (2)定义需要用到的模型
+        self.conv1 = nn.Conv1d(
+            in_channels=(num_patches-1),      # 输入通道数
+            out_channels=num_patches,       # 输出通道数
+            kernel_size=1,      # 卷积核大小
+            stride=1,           # 步长
+            bias=True           # 是否使用偏置项
+        )
+
+        self.conv2 = nn.Sequential(
+            # 第一层：扩大通道数，捕捉局部模式
+            nn.Conv1d(in_channels=3, out_channels=32, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2),  # 输出长度: (371 - 2)//2 + 1 = 186
+
+            # 第二层：加深网络，提取抽象特征
+            nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2, stride=2),  # 输出长度: 93
+
+            # 第三层：进一步压缩时序维度
+            nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # 全局平均池化，输出 [300, 128, 1]
+            nn.Flatten()              # 最终特征: [300, 128]
+        )
+
+    def forward(self, x):
+
+
+        # self.num_patches的选择:[7,30,90,180,360],不同的对应不同的长度
+        window_size = args.patch_size
+        step_size = args.patch_size // 2
+        # num_epochs = (args.seq_len - window_size) // step_size + 1  (343)
+        x_patch = Sliding_window(x, window_size, step_size)# (num, 1, num_patches, window_size)
+
+        #(1):(num, 1, 1024) -> (num, num_patch, self.patch_size),按照周期将数据重排列
+        # x_patch = x.reshape(x.shape[0], -1, self.patch_size)
+        #(2):计算均值(num, 1, num_patches, window_size) -> (num, 1, num_patches)
+        x_patch_mean = torch.mean(x_patch, dim=-1)
+
+        #(3):计算标准差(num, 1, num_patches, window_size) -> (num, 1, num_patches)
+        # x_patch_std = torch.std(x_patch, dim=-1, keepdim=True)
+        x_patch_std = torch.std(x_patch, dim=-1)
+        # (num, 2, num_patches)
+        statistics = torch.cat([x_patch_mean, x_patch_std], dim=1)
+
+        #  (num, 1, num_patches, window_size) -> (num, 1, num_patches-1, window_size)
+        diff_x = torch.diff(x_patch, n=1, axis=2)
+        # (num, 1, num_patches-1, window_size) -> (num, 1, num_patches-1)
+        diff_x_patch_max = torch.max(diff_x, dim=-1).values
+        diff_x_patch_max = diff_x_patch_max.transpose(1, 2)
+        # diff_x_2_transposed = diff_x_2.permute(0, 2, 1)  # 调整维度
+        diff_x_2 = self.conv1(diff_x_patch_max)# (num, num_patches, 1)
+        diff_x_2 = diff_x_2.transpose(1, 2)# (num, 1, num_patches)
+        # (num, 3, num_patches)
+        x3 = torch.cat([statistics, diff_x_2], dim=1)  # 拼接
+        # x_3_transposed = x_3.permute(0, 2, 1)  # 调整维度
+        # x_4 = self.conv2(x_3)
+        # x_4 = x_4.transpose(1, 2) 
+        # x_4 = self.linear(x_4) 
+        x4 = self.conv2(x3)
+        # x4 = self.conv3(x3)
+        return x4
+
+
+
 class TSLANet(L.LightningModule):
     def __init__(self):
         super().__init__()
@@ -165,8 +269,18 @@ class TSLANet(L.LightningModule):
             for i in range(args.depth)]
         )
 
-        # Classifier head
-        self.head = nn.Linear(args.emb_dim, args.num_classes)
+        # 统计特征提取输出维度 (num, 3, num_patches)
+        # self.statis_layer = Statis_layer()
+
+        # Classifier head规定输入维度和输出维度,因为损失函数的缘故,此处用args.num_classes-1
+        if args.criterion == 'cross_entropy':
+            self.head = nn.Linear(args.emb_dim, args.num_classes)
+            self.head2 = nn.Linear(128, args.num_classes)
+        elif args.criterion == 'bce':
+            self.head = nn.Linear(args.emb_dim, args.num_classes-1)
+            self.head2 = nn.Linear(128, args.num_classes-1)
+        # self.head3 = nn.Linear(1034, args.num_classes)
+
 
         # init weights
         trunc_normal_(self.pos_embed, std=.02)
@@ -195,6 +309,7 @@ class TSLANet(L.LightningModule):
         return x_masked, x_patched
 
     def forward(self, x):
+        # x_statis = self.statis_layer(x)
         x = self.patch_embed(x)
         x = x + self.pos_embed
         x = self.pos_drop(x)
@@ -203,6 +318,7 @@ class TSLANet(L.LightningModule):
             x = tsla_blk(x)
 
         x = x.mean(1)
+        # x = self.head(x) + self.head2(x_statis)
         x = self.head(x)
         return x
 
@@ -218,7 +334,9 @@ class model_pretraining(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.pretrain_lr, weight_decay=1e-4)
-        return optimizer
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def _calculate_loss(self, batch, mode="train"):
         data = batch[0]
@@ -249,8 +367,19 @@ class model_training(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = TSLANet()
-        self.f1 = MulticlassF1Score(num_classes=args.num_classes)
-        self.criterion = LabelSmoothingCrossEntropy()
+        # self.fc = nn.Linear(2, 1)  # 输出形状(N,1)
+        if args.criterion == 'cross_entropy':
+            self.criterion = LabelSmoothingCrossEntropy()
+            self.f1 = MulticlassF1Score(num_classes=args.num_classes)
+            self.confmat = ConfusionMatrix(task="binary", num_classes=args.num_classes).to(self.device)
+        elif args.criterion == 'bce':
+            self.criterion = nn.BCEWithLogitsLoss()
+            self.acc = BinaryAccuracy(threshold=0.5)
+            self.f1 = BinaryF1Score(threshold=0.5)
+            self.precision = BinaryPrecision(threshold=0.5)
+            self.recall = BinaryRecall(threshold=0.5)
+            self.auroc = BinaryAUROC()
+            self.confmat = ConfusionMatrix(task="binary", threshold=0.5)
         # 用于储存测试集得预测和真实标签
         self.test_preds = []
         self.test_targets = []
@@ -260,24 +389,47 @@ class model_training(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
-        return optimizer
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+        
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
 
     def _calculate_loss(self, batch, mode="train"):
-        data = batch[0]
-        labels = batch[1].to(torch.int64)
+        data ,labels = batch[0], batch[1].float()
+        preds = self.model(data)
 
-        preds = self.model.forward(data)
-        loss = self.criterion(preds, labels)
-        acc = (preds.argmax(dim=-1) == labels).float().mean()
-        f1 = self.f1(preds, labels)
+        if args.criterion == 'cross_entropy':
+            loss = self.criterion(preds, labels)
+            acc = (preds.argmax(dim=-1) == labels).float().mean()
+            f1 = self.f1(preds, labels)
+        elif args.criterion == 'bce':
+            # realy_labels = torch.nn.functional.one_hot(labels, num_classes=args.num_classes).float()
+            # change_preds = self.fc(preds)
+            # 计算部分：
+            probs = torch.sigmoid(preds.squeeze(1))
+            loss = self.criterion(preds.squeeze(1), labels)  # 形状(N,) vs (N,)
 
-        # Logging for both step and epoch
-        self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_f1", f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log_dict({
+                f"{mode}_loss": loss,
+                f"{mode}_acc": self.acc(probs, labels),
+                f"{mode}_f1": self.f1(probs, labels),
+                f"{mode}_precision": self.precision(probs, labels),
+                f"{mode}_recall": self.recall(probs, labels),
+                f"{mode}_auroc": self.auroc(probs, labels),
+            })
+
+        # # Logging for both step and epoch
+        # self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        # self.log(f"{mode}_f1", f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # self.log(f"{mode}_precision", precision, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # self.log(f"{mode}_recall", recall, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # self.log(f"{mode}_auroc", auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+       
+       
         if mode == "test":
-            self.test_preds.append(preds.argmax(dim=-1).cpu())
-            self.test_targets.append(labels.cpu())
+            self.test_preds.append(probs > 0.5)
+            self.test_targets.append(labels.bool())
             
         return loss
 
@@ -292,14 +444,21 @@ class model_training(L.LightningModule):
         self._calculate_loss(batch, mode="test")
 
     def on_test_epoch_end(self):
-        # 在所有测试批次完成后，生成混淆矩阵
-        if len(self.test_preds) > 0:
-            test_preds = torch.cat(self.test_preds)
-            test_targets = torch.cat(self.test_targets)
-            
-            # 生成混淆矩阵
-            cm = confusion_matrix(test_targets.numpy(), test_preds.numpy())
-            print("Confusion Matrix:\n", cm)
+        # (test阶段)在所有测试批次完成后，生成混淆矩阵
+        targets = torch.cat(self.test_targets).int()
+        preds = torch.cat(self.test_preds).int()
+        
+        # 生成混淆矩阵
+        cm = self.confmat(preds, targets)
+        print(f"\nConfusion Matrix:\n", cm.cpu().numpy())
+        # 将混淆矩阵保存到文本文件
+        text_save_dir = "/TSLANet/Classification/textFiles"
+        os.makedirs(text_save_dir, exist_ok=True)
+        with open(f"{text_save_dir}/{args.model_id}.txt", 'a') as f:
+            f.write(f"{run_description}_name_{args.name}_{os.path.basename(args.data_path)}")
+            f.write("\nConfusion Matrix:\n")
+            f.write(np.array2string(cm.cpu().numpy(), separator=', '))
+            f.write('\n')
 
 
 def pretrain_model():
@@ -328,18 +487,18 @@ def pretrain_model():
 
 
 def train_model(pretrained_model_path):
-    # # 创建 TensorBoardLogger
-    # tensorboard_logger = TensorBoardLogger(
-    #     save_dir=args.checkpoints,  # 日志保存路径
-    #     name="tensorboard_logs"     # 日志文件夹名称
-    # )
+    # 创建 TensorBoardLogger
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=args.checkpoints,  # 日志保存路径
+        name="tensorboard_logs"     # 日志文件夹名称
+    )
     trainer = L.Trainer(
         default_root_dir=CHECKPOINT_PATH,
         accelerator="auto",
         devices=1,
         num_sanity_val_steps=0,
         max_epochs=MAX_EPOCHS,
-        # logger=tensorboard_logger,
+        logger=tensorboard_logger,
         callbacks=[
             checkpoint_callback,
             LearningRateMonitor("epoch"),
@@ -360,24 +519,28 @@ def train_model(pretrained_model_path):
     # Load the best checkpoint after training
     model = model_training.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
 
-    # Test best model on validation and test set
-    val_result = trainer.test(model, dataloaders=val_loader, verbose=False)
+    # 对测试集进行模型测试
     test_result = trainer.test(model, dataloaders=test_loader, verbose=False)
 
-    acc_result = {"test": test_result[0]["test_acc"], "val": val_result[0]["test_acc"]}
-    f1_result = {"test": test_result[0]["test_f1"], "val": val_result[0]["test_f1"]}
+    acc_result = {"test": test_result[0]["test_acc"]}
+    f1_result = {"test": test_result[0]["test_f1"]}
+    precision_result = {"test": test_result[0]["test_precision"]}
+    recall_result = {"test": test_result[0]["test_recall"]}
+    auroc_result = {"test": test_result[0]["test_auroc"]}
 
     get_clf_report(model, test_loader, CHECKPOINT_PATH, args.class_names)
 
-    return model, acc_result, f1_result
+    return model, acc_result, f1_result, precision_result, recall_result, auroc_result
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_id', type=str, default='TEST')
-    parser.add_argument('--data_path', type=str, default=r'data/hhar')
-    parser.add_argument('--name', type=str, default='随机测试专用')
+    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/dataset_rate_0605')
+    parser.add_argument('--name', type=str, default='T_0602文件随机测试专用')
+    parser.add_argument('--checkpoints', type=str, default=r'/home/tslanet/checkpoints',)
+
     
     # Training parameters:
     parser.add_argument('--num_epochs', type=int, default=100)
@@ -385,13 +548,15 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train_lr', type=float, default=1e-3)
     parser.add_argument('--pretrain_lr', type=float, default=1e-3)
+    parser.add_argument('--criterion', type=str, default='bce', choices=['cross_entropy', 'bce'], help='Loss function to use')
+
 
     # Model parameters:
     parser.add_argument('--emb_dim', type=int, default=128)
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--masking_ratio', type=float, default=0.4)
-    parser.add_argument('--dropout_rate', type=float, default=0.15)
-    parser.add_argument('--patch_size', type=int, default=8)
+    parser.add_argument('--dropout_rate', type=float, default=0.5)# 0.15
+    parser.add_argument('--patch_size', type=int, default=7)
 
     # TSLANet components:
     parser.add_argument('--load_from_pretrained', type=str2bool, default=True, help='False: without pretraining')
@@ -405,13 +570,10 @@ if __name__ == '__main__':
     print(DATASET_PATH)
 
     # load from checkpoint
-    run_description = f"{os.path.basename(args.data_path)}_dim{args.emb_dim}_depth{args.depth}___"
-    run_description += f"ASB_{args.ASB}__AF_{args.adaptive_filter}__ICB_{args.ICB}__preTr_{args.load_from_pretrained}_"
-    run_description += f"{datetime.datetime.now().strftime('%H_%M_%S')}"
+    run_description = f"0604{args.name}"
     print(f"========== {run_description} ===========")
-    run_description = f"实验描述{args.name}"
 
-    CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{args.name}"
+    CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{run_description}"
     pretrain_checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
@@ -431,14 +593,15 @@ if __name__ == '__main__':
     save_copy_of_files(pretrain_checkpoint_callback)
 
     # Ensure that all operations are deterministic on GPU (if used) for reproducibility
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
     # load datasets ...
     train_loader, val_loader, test_loader = get_datasets(DATASET_PATH, args)
     print("Dataset loaded ...")
 
     # Get dataset characteristics ...
+
     args.num_classes = len(np.unique(train_loader.dataset.y_data))
     args.class_names = [str(i) for i in range(args.num_classes)]
     args.seq_len = train_loader.dataset.x_data.shape[-1]
@@ -449,17 +612,18 @@ if __name__ == '__main__':
     else:
         best_model_path = ''
 
-    model, acc_results, f1_results = train_model(best_model_path)
-    print("ACC results", acc_results)
-    print("F1  results", f1_results)
+    model, acc_result, f1_result, precision_result, recall_result, auroc_result = train_model(best_model_path)
+    print("ACC results", acc_result)
+    print("F1  results", f1_result)
+    print("Precision results", precision_result)
+    print("Recall results", recall_result)
+    print("AUROC results", auroc_result)
 
     # append result to a text file...
     text_save_dir = "/TSLANet/Classification/textFiles"
     os.makedirs(text_save_dir, exist_ok=True)
     f = open(f"{text_save_dir}/{args.model_id}.txt", 'a')
-    f.write(run_description + "  \n")
-    f.write(f"TSLANet_{os.path.basename(args.data_path)}_l_{args.depth}" + "  \n")
-    f.write('acc:{}, mf1:{}'.format(acc_results, f1_results))
+    f.write('acc:{}, mf1:{}, pre:{}, reca:{}, auroc:{}'.format(acc_result, f1_result, precision_result, recall_result, auroc_result))
     f.write('\n')
     f.write('\n')
     f.close()

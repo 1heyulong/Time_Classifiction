@@ -88,7 +88,7 @@ def get_datasets(DATASET_PATH, args):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=32,
         pin_memory=True,
         drop_last=True
     )
@@ -96,7 +96,7 @@ def get_datasets(DATASET_PATH, args):
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=8,
+        num_workers=32,
         pin_memory=True,
         shuffle=False
     )
@@ -104,7 +104,7 @@ def get_datasets(DATASET_PATH, args):
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=batch_size,
-        num_workers=8,
+        num_workers=32,
         pin_memory=True,
         shuffle=False
     )

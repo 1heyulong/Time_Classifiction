@@ -342,7 +342,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
 
     # Model parameters:
-    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--emb_dim', type=int, default=128)
     parser.add_argument('--depth', type=int, default=2, help="控制神经网络深度")
     parser.add_argument('--dropout', type=float, default=0.15)
@@ -360,11 +360,11 @@ if __name__ == '__main__':
     print(DATASET_PATH)
 
     # load from checkpoint
-    run_description = f"model{args.module}_data{args.data_path}"
+    run_description = f"model{args.module}"
     run_description += f"_time{datetime.datetime.now().strftime('%H_%M')}_{args.name}"
     print(f"========== {run_description} ===========")
     
-    CHECKPOINT_PATH = f"/hy-tmp/store_result/time_0530/{run_description}"
+    CHECKPOINT_PATH = f"/hy-tmp/store_result/time_0603/{run_description}"
 
     # Ensure that all operations are deterministic on GPU (if used) for reproducibility
     torch.backends.cudnn.deterministic = True
