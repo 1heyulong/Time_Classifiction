@@ -3,25 +3,28 @@ import datetime
 import os
 
 import lightning as L
-import pandas as pd
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.loggers import TensorBoardLogger
+from sklearn.metrics import confusion_matrix
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from einops import rearrange
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
+
+from timm.loss import LabelSmoothingCrossEntropy
 from timm.models.layers import DropPath
 from timm.models.layers import trunc_normal_
-from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
+from torchmetrics.classification import MulticlassF1Score
 
-from data_factory import data_provider
-from utils import save_copy_of_files, random_masking_3D, str2bool
+from dataloader import get_datasets
+from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
 
 
 class ICB(L.LightningModule):
     def __init__(self, in_features, hidden_features, drop=0.):
         super().__init__()
         self.conv1 = nn.Conv1d(in_features, hidden_features, 1)
-        self.conv2 = nn.Conv1d(in_features, hidden_features, 3, 1, padding=1)
+        self.conv2 = nn.Conv1d(in_features, hidden_features, 3, 1, 1)
         self.conv3 = nn.Conv1d(hidden_features, in_features, 1)
         self.drop = nn.Dropout(drop)
         self.act = nn.GELU()
@@ -42,6 +45,19 @@ class ICB(L.LightningModule):
         x = self.conv3(out1 + out2)
         x = x.transpose(1, 2)
         return x
+
+
+class PatchEmbed(L.LightningModule):
+    def __init__(self, seq_len, patch_size=8, in_chans=3, embed_dim=384):
+        super().__init__()
+        stride = patch_size // 2
+        num_patches = int((seq_len - patch_size) / stride + 1)
+        self.num_patches = num_patches
+        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=patch_size, stride=stride)
+
+    def forward(self, x):
+        x_out = self.proj(x).flatten(2).transpose(1, 2)
+        return x_out
 
 
 class Adaptive_Spectral_Block(nn.Module):
@@ -66,7 +82,8 @@ class Adaptive_Spectral_Block(nn.Module):
         median_energy = median_energy.view(B, 1)  # Reshape to match the original dimensions
 
         # Normalize energy
-        normalized_energy = energy / (median_energy + 1e-6)
+        epsilon = 1e-6  # Small constant to avoid division by zero
+        normalized_energy = energy / (median_energy + epsilon)
 
         adaptive_mask = ((normalized_energy > self.threshold_param).float() - self.threshold_param).detach() + self.threshold_param
         adaptive_mask = adaptive_mask.unsqueeze(-1)
@@ -127,66 +144,67 @@ class TSLANet_layer(L.LightningModule):
         return x
 
 
-class TSLANet(nn.Module):
-
+class TSLANet(L.LightningModule):
     def __init__(self):
-        super(TSLANet, self).__init__()
+        super().__init__()
+        self.patch_embed = PatchEmbed(
+            seq_len=args.seq_len, patch_size=args.patch_size,
+            in_chans=args.num_channels, embed_dim=args.emb_dim
+        )
+        num_patches = self.patch_embed.num_patches
 
-        self.patch_size = args.patch_size
-        self.stride = self.patch_size // 2
-        num_patches = int((args.seq_len - self.patch_size) / self.stride + 1)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, args.emb_dim), requires_grad=True)
+        self.pos_drop = nn.Dropout(p=args.dropout_rate)
 
-        # Layers/Networks
-        self.input_layer = nn.Linear(self.patch_size, args.emb_dim)
+        self.input_layer = nn.Linear(args.patch_size, args.emb_dim)
 
-        dpr = [x.item() for x in torch.linspace(0, args.dropout, args.depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, args.dropout_rate, args.depth)]  # stochastic depth decay rule
 
         self.tsla_blocks = nn.ModuleList([
-            TSLANet_layer(dim=args.emb_dim, drop=args.dropout, drop_path=dpr[i])
+            TSLANet_layer(dim=args.emb_dim, drop=args.dropout_rate, drop_path=dpr[i])
             for i in range(args.depth)]
         )
 
-        # Parameters/Embeddings
-        self.out_layer = nn.Linear(args.emb_dim * num_patches, args.pred_len)
+        # Classifier head
+        self.head = nn.Linear(args.emb_dim, args.num_classes)
+
+        # init weights
+        trunc_normal_(self.pos_embed, std=.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
     def pretrain(self, x_in):
-        x = rearrange(x_in, 'b l m -> b m l')
-        x_patched = x.unfold(dimension=-1, size=self.patch_size, step=self.stride)
-        x_patched = rearrange(x_patched, 'b m n p -> (b m) n p')
+        x = self.patch_embed(x_in)
+        x = x + self.pos_embed
+        x_patched = self.pos_drop(x)
 
-        xb_mask, _, self.mask, _ = random_masking_3D(x_patched, mask_ratio=args.mask_ratio)
-        self.mask = self.mask.bool()  # mask: [bs x num_patch]
-        xb_mask = self.input_layer(xb_mask)
+        x_masked, _, self.mask, _ = random_masking_3D(x, mask_ratio=args.masking_ratio)
+        self.mask = self.mask.bool()  # mask: [bs x num_patch x n_vars]
 
         for tsla_blk in self.tsla_blocks:
-            xb_mask = tsla_blk(xb_mask)
+            x_masked = tsla_blk(x_masked)
 
-        return xb_mask, self.input_layer(x_patched)
-
+        return x_masked, x_patched
 
     def forward(self, x):
-        B, L, M = x.shape
-
-        means = x.mean(1, keepdim=True).detach()
-        x = x - means
-        stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
-        x /= stdev
-
-        x = rearrange(x, 'b l m -> b m l')
-        x = x.unfold(dimension=-1, size=self.patch_size, step=self.stride)
-        x = rearrange(x, 'b m n p -> (b m) n p')
-        x = self.input_layer(x)
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
 
         for tsla_blk in self.tsla_blocks:
             x = tsla_blk(x)
 
-        outputs = self.out_layer(x.reshape(B * M, -1))
-        outputs = rearrange(outputs, '(b m) l -> b l m', b=B)
-
-        outputs = outputs * stdev
-        outputs = outputs + means
-
-        return outputs
+        x = x.mean(1)
+        x = self.head(x)
+        return x
 
 
 class model_pretraining(L.LightningModule):
@@ -199,15 +217,13 @@ class model_pretraining(L.LightningModule):
         return self.model(x)
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-6)
+        optimizer = optim.AdamW(self.parameters(), lr=args.pretrain_lr, weight_decay=1e-4)
         return optimizer
 
     def _calculate_loss(self, batch, mode="train"):
-        batch_x, batch_y, _, _ = batch
-        _, _, C = batch_x.shape
-        batch_x = batch_x.float().to(device)
+        data = batch[0]
 
-        preds, target = self.model.pretrain(batch_x)
+        preds, target = self.model.pretrain(data)
 
         loss = (preds - target) ** 2
         loss = loss.mean(dim=-1)
@@ -233,78 +249,63 @@ class model_training(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = TSLANet()
-        self.criterion = nn.MSELoss()
-        self.mse = MeanSquaredError()
-        self.mae = MeanAbsoluteError()
-        self.preds = []
-        self.trues = []
+        self.f1 = MulticlassF1Score(num_classes=args.num_classes)
+        self.criterion = LabelSmoothingCrossEntropy()
+        # 用于储存测试集得预测和真实标签
+        self.test_preds = []
+        self.test_targets = []
 
     def forward(self, x):
         return self.model(x)
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-6)
-        scheduler = {
-            'scheduler': optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2,
-                                                              verbose=True),
-            'monitor': 'val_mse',
-            'interval': 'epoch',
-            'frequency': 1
-        }
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+        # optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
+        optimizer = optim.RAdam(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
+        return optimizer
 
     def _calculate_loss(self, batch, mode="train"):
-        batch_x, batch_y, _, _ = batch
-        batch_x = batch_x.float().to(device)
-        batch_y = batch_y.float().to(device)
+        data = batch[0]
+        labels = batch[1].to(torch.int64)
 
-        outputs = self.model(batch_x)
-        outputs = outputs[:, -args.pred_len:, :]
-        batch_y = batch_y[:, -args.pred_len:, :].to(device)
-        loss = self.criterion(outputs, batch_y)
-
-        pred = outputs.detach().cpu()
-        true = batch_y.detach().cpu()
-
-        mse = self.mse(pred.contiguous(), true.contiguous())
-        mae = self.mae(pred, true)
+        preds = self.model.forward(data)
+        loss = self.criterion(preds, labels)
+        acc = (preds.argmax(dim=-1) == labels).float().mean()
+        f1 = self.f1(preds, labels)
 
         # Logging for both step and epoch
         self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_mse", mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_mae", mae, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return loss, pred, true
+        self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{mode}_f1", f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        if mode == "test":
+            self.test_preds.append(preds.argmax(dim=-1).cpu())
+            self.test_targets.append(labels.cpu())
+            
+        return loss
 
     def training_step(self, batch, batch_idx):
-        loss, _, _ = self._calculate_loss(batch, mode="train")
+        loss = self._calculate_loss(batch, mode="train")
         return loss
 
     def validation_step(self, batch, batch_idx):
         self._calculate_loss(batch, mode="val")
 
     def test_step(self, batch, batch_idx):
-        loss, preds, trues = self._calculate_loss(batch, mode="test")
-        self.preds.append(preds)
-        self.trues.append(trues)
-        return {'test_loss': loss, 'pred': preds, 'true': trues}
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
+        self._calculate_loss(batch, mode="test")
 
     def on_test_epoch_end(self):
-        preds = torch.cat(self.preds)
-        trues = torch.cat(self.trues)
-
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-
-        mse = self.mse(preds.contiguous(), trues.contiguous())
-        mae = self.mae(preds, trues)
-        print(f"{mae, mse}")
+        # 在所有测试批次完成后，生成混淆矩阵
+        if len(self.test_preds) > 0:
+            test_preds = torch.cat(self.test_preds)
+            test_targets = torch.cat(self.test_targets)
+            
+            # 生成混淆矩阵
+            cm = confusion_matrix(test_targets.numpy(), test_preds.numpy())
+            print("Confusion Matrix:\n", cm)
 
 
 def pretrain_model():
     PRETRAIN_MAX_EPOCHS = args.pretrain_epochs
+
     trainer = L.Trainer(
         default_root_dir=CHECKPOINT_PATH,
         accelerator="auto",
@@ -320,20 +321,26 @@ def pretrain_model():
     trainer.logger._log_graph = False  # If True, we plot the computation graph in tensorboard
     trainer.logger._default_hp_metric = None  # Optional logging argument that we don't need
 
-    L.seed_everything(args.seed)  # To be reproducible
+    L.seed_everything(42)  # To be reproducible
     model = model_pretraining()
     trainer.fit(model, train_loader, val_loader)
 
-    return model, pretrain_checkpoint_callback.best_model_path
+    return pretrain_checkpoint_callback.best_model_path
 
 
 def train_model(pretrained_model_path):
+    # # 创建 TensorBoardLogger
+    # tensorboard_logger = TensorBoardLogger(
+    #     save_dir=args.checkpoints,  # 日志保存路径
+    #     name="tensorboard_logs"     # 日志文件夹名称
+    # )
     trainer = L.Trainer(
         default_root_dir=CHECKPOINT_PATH,
         accelerator="auto",
-        num_sanity_val_steps=0,
         devices=1,
-        max_epochs=args.train_epochs,
+        num_sanity_val_steps=0,
+        max_epochs=MAX_EPOCHS,
+        # logger=tensorboard_logger,
         callbacks=[
             checkpoint_callback,
             LearningRateMonitor("epoch"),
@@ -343,60 +350,49 @@ def train_model(pretrained_model_path):
     trainer.logger._log_graph = False  # If True, we plot the computation graph in tensorboard
     trainer.logger._default_hp_metric = None  # Optional logging argument that we don't need
 
-    L.seed_everything(args.seed)  # To be reproducible
+    L.seed_everything(42)  # To be reproducible
     if args.load_from_pretrained:
         model = model_training.load_from_checkpoint(pretrained_model_path)
     else:
         model = model_training()
+
     trainer.fit(model, train_loader, val_loader)
 
     # Load the best checkpoint after training
     model = model_training.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
+
     # Test best model on validation and test set
     val_result = trainer.test(model, dataloaders=val_loader, verbose=False)
     test_result = trainer.test(model, dataloaders=test_loader, verbose=False)
-    mse_result = {"test": test_result[0]["test_mse"], "val": val_result[0]["test_mse"]}
-    mae_result = {"test": test_result[0]["test_mae"], "val": val_result[0]["test_mae"]}
 
-    return model, mse_result, mae_result
+    acc_result = {"test": test_result[0]["test_acc"], "val": val_result[0]["test_acc"]}
+    f1_result = {"test": test_result[0]["test_f1"], "val": val_result[0]["test_f1"]}
+
+    get_clf_report(model, test_loader, CHECKPOINT_PATH, args.class_names)
+
+    return model, acc_result, f1_result
 
 
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model_id', type=str, default='TEST')
+    parser.add_argument('--data_path', type=str, default=r'data/hhar')
+    parser.add_argument('--name', type=str, default='随机测试专用')
+    
+    # Training parameters:
+    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--pretrain_epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--train_lr', type=float, default=1e-3)
+    parser.add_argument('--pretrain_lr', type=float, default=1e-3)
 
-    # Data args...
-    parser.add_argument('--data', type=str, default='ETTh1', help='dataset type')
-    parser.add_argument('--root_path', type=str, default='data/ETT-small',
-                        help='root path of the data file')
-    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
-    parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding, options:[timeF, fixed, learned]')
-
-    parser.add_argument('--features', type=str, default='M',
-                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
-    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
-    parser.add_argument('--freq', type=str, default='h',
-                        help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
-
-    # forecasting lengths
-    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
-    parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
-
-    # optimization
-    parser.add_argument('--train_epochs', type=int, default=20, help='train epochs')
-    parser.add_argument('--pretrain_epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=64, help='batch size of train input data')
-    parser.add_argument('--seed', type=int, default=42)
-
-    # model
-    parser.add_argument('--emb_dim', type=int, default=64, help='dimension of model')
-    parser.add_argument('--depth', type=int, default=3, help='num of layers')
-    parser.add_argument('--dropout', type=float, default=0.5, help='dropout value')
-    parser.add_argument('--patch_size', type=int, default=64, help='size of patches')
-    parser.add_argument('--mask_ratio', type=float, default=0.4)
+    # Model parameters:
+    parser.add_argument('--emb_dim', type=int, default=128)
+    parser.add_argument('--depth', type=int, default=2)
+    parser.add_argument('--masking_ratio', type=float, default=0.4)
+    parser.add_argument('--dropout_rate', type=float, default=0.15)
+    parser.add_argument('--patch_size', type=int, default=90)
 
     # TSLANet components:
     parser.add_argument('--load_from_pretrained', type=str2bool, default=True, help='False: without pretraining')
@@ -405,17 +401,15 @@ if __name__ == '__main__':
     parser.add_argument('--adaptive_filter', type=str2bool, default=True)
 
     args = parser.parse_args()
+    DATASET_PATH = args.data_path
+    MAX_EPOCHS = args.num_epochs
+    print('数据来源', DATASET_PATH)
 
-    device = torch.device('cuda:{}'.format(0))
+    run_description = f"{args.name}"
+    print(f"========== 模型描述/{run_description} ===========")
 
-    # load from checkpoint
-    run_description = f"{args.data_path.split('.')[0]}_emb{args.emb_dim}_d{args.depth}_ps{args.patch_size}"
-    run_description += f"_pl{args.pred_len}_bs{args.batch_size}_mr{args.mask_ratio}"
-    run_description += f"_ASB_{args.ASB}_AF_{args.adaptive_filter}_ICB_{args.ICB}_preTr_{args.load_from_pretrained}"
-    run_description += f"_{datetime.datetime.now().strftime('%H_%M')}"
-    print(f"========== {run_description} ===========")
 
-    CHECKPOINT_PATH = f"lightning_logs/{run_description}"
+    CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{args.name}"
     pretrain_checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
@@ -427,44 +421,43 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
-        monitor='val_mse',
+        monitor='val_loss',
         mode='min'
     )
 
     # Save a copy of this file and configs file as a backup
-    save_copy_of_files(checkpoint_callback)
+    save_copy_of_files(pretrain_checkpoint_callback)
 
     # Ensure that all operations are deterministic on GPU (if used) for reproducibility
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
     # load datasets ...
-    train_data, train_loader = data_provider(args, flag='train')
-    vali_data, val_loader = data_provider(args, flag='val')
-    test_data, test_loader = data_provider(args, flag='test')
+    train_loader, val_loader, test_loader = get_datasets(DATASET_PATH, args)
     print("Dataset loaded ...")
 
+    # Get dataset characteristics ...
+    args.num_classes = len(np.unique(train_loader.dataset.y_data))
+    args.class_names = [str(i) for i in range(args.num_classes)]
+    args.seq_len = train_loader.dataset.x_data.shape[-1]
+    args.num_channels = train_loader.dataset.x_data.shape[1]
+
     if args.load_from_pretrained:
-        pretrained_model, best_model_path = pretrain_model()
+        best_model_path = pretrain_model()
     else:
         best_model_path = ''
 
-    model, mse_result, mae_result = train_model(best_model_path)
-    print("MSE results", mse_result)
-    print("MAE  results", mae_result)
+    model, acc_results, f1_results = train_model(best_model_path)
+    print("ACC results", acc_results)
+    print("F1  results", f1_results)
 
-    # Save results into an Excel sheet ...
-    df = pd.DataFrame({
-        'MSE': mse_result,
-        'MAE': mae_result
-    })
-    df.to_excel(os.path.join(CHECKPOINT_PATH, f"results_{datetime.datetime.now().strftime('%H_%M')}.xlsx"))
-
-    # Append results into a text file ...
-    os.makedirs("textOutput", exist_ok=True)
-    f = open(f"textOutput/TSLANet_{os.path.basename(args.data_path)}.txt", 'a')
+    # append result to a text file...
+    text_save_dir = "/TSLANet/Classification/textFiles"
+    os.makedirs(text_save_dir, exist_ok=True)
+    f = open(f"{text_save_dir}/{args.model_id}.txt", 'a')
     f.write(run_description + "  \n")
-    f.write('MSE:{}, MAE:{}'.format(mse_result, mae_result))
+    f.write(f"TSLANet_{os.path.basename(args.data_path)}_l_{args.depth}" + "  \n")
+    f.write('acc:{}, mf1:{}'.format(acc_results, f1_results))
     f.write('\n')
     f.write('\n')
     f.close()

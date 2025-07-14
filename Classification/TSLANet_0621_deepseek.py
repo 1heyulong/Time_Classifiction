@@ -166,6 +166,8 @@ class TSLANet(L.LightningModule):
         )
 
         # Classifier head
+        self.pool = nn.Linear(args.emb_dim, 1)
+        
         self.head = nn.Linear(args.emb_dim, args.num_classes)
 
         # init weights
@@ -201,8 +203,11 @@ class TSLANet(L.LightningModule):
 
         for tsla_blk in self.tsla_blocks:
             x = tsla_blk(x)
-
-        x = x.mean(1)
+        # print(x.shape, "x shape after TSLANet blocks")
+        attn_weights = torch.softmax(self.pool(x), dim=1)
+        # print(attn_weights.shape, "attn_weights shape after pooling")
+        x = (x * attn_weights).sum(dim=1)
+        # x = x.mean(1)
         x = self.head(x)
         return x
 
@@ -259,8 +264,7 @@ class model_training(L.LightningModule):
         return self.model(x)
 
     def configure_optimizers(self):
-        # optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
-        optimizer = optim.RAdam(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
         return optimizer
 
     def _calculate_loss(self, batch, mode="train"):
@@ -392,10 +396,10 @@ if __name__ == '__main__':
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--masking_ratio', type=float, default=0.4)
     parser.add_argument('--dropout_rate', type=float, default=0.15)
-    parser.add_argument('--patch_size', type=int, default=90)
+    parser.add_argument('--patch_size', type=int, default=7)
 
     # TSLANet components:
-    parser.add_argument('--load_from_pretrained', type=str2bool, default=True, help='False: without pretraining')
+    parser.add_argument('--load_from_pretrained', type=str2bool, default=False, help='False: without pretraining')
     parser.add_argument('--ICB', type=str2bool, default=True)
     parser.add_argument('--ASB', type=str2bool, default=True)
     parser.add_argument('--adaptive_filter', type=str2bool, default=True)
@@ -403,11 +407,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     DATASET_PATH = args.data_path
     MAX_EPOCHS = args.num_epochs
-    print('数据来源', DATASET_PATH)
+    print(DATASET_PATH)
 
-    run_description = f"{args.name}"
-    print(f"========== 模型描述/{run_description} ===========")
-
+    # load from checkpoint
+    run_description = f"{os.path.basename(args.data_path)}_dim{args.emb_dim}_depth{args.depth}___"
+    run_description += f"ASB_{args.ASB}__AF_{args.adaptive_filter}__ICB_{args.ICB}__preTr_{args.load_from_pretrained}_"
+    run_description += f"{datetime.datetime.now().strftime('%H_%M_%S')}"
+    print(f"========== {run_description} ===========")
+    run_description = f"实验描述{args.name}"
 
     CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{args.name}"
     pretrain_checkpoint_callback = ModelCheckpoint(
