@@ -16,7 +16,7 @@ from timm.models.layers import DropPath
 from timm.models.layers import trunc_normal_
 from torchmetrics.classification import MulticlassF1Score
 
-from dataloader import get_datasets
+from TSLANetshiyan import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
 
 
@@ -376,12 +376,12 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_id', type=str, default='TEST')
-    parser.add_argument('--data_path', type=str, default=r'data/hhar')
+    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/0716_realdata/')
     parser.add_argument('--name', type=str, default='随机测试专用')
     
     # Training parameters:
     parser.add_argument('--num_epochs', type=int, default=100)
-    parser.add_argument('--pretrain_epochs', type=int, default=50)
+    parser.add_argument('--pretrain_epochs', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train_lr', type=float, default=1e-3)
     parser.add_argument('--pretrain_lr', type=float, default=1e-3)
@@ -391,7 +391,7 @@ if __name__ == '__main__':
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--masking_ratio', type=float, default=0.4)
     parser.add_argument('--dropout_rate', type=float, default=0.15)
-    parser.add_argument('--patch_size', type=int, default=7)
+    parser.add_argument('--patch_size', type=int, default=90)
 
     # TSLANet components:
     parser.add_argument('--load_from_pretrained', type=str2bool, default=False, help='False: without pretraining')

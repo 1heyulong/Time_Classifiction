@@ -19,7 +19,7 @@ from timm.loss import LabelSmoothingCrossEntropy
 from timm.models.layers import DropPath, trunc_normal_
 from torchmetrics.classification import MulticlassF1Score, BinaryF1Score
 
-from dataloader import get_datasets
+from TSLANetshiyan import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D, Inception_Block_V1
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 

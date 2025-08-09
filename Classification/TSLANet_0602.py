@@ -16,7 +16,7 @@ from timm.models.layers import DropPath
 from timm.models.layers import trunc_normal_
 from torchmetrics.classification import MulticlassF1Score
 
-from dataloader import get_datasets
+from TSLANetshiyan import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
 
 

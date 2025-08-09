@@ -9,6 +9,7 @@ import inspect
 from einops import rearrange
 import numpy as np
 
+
 def get_clf_report(model, dataloader, save_dir, class_names):
     # GET THE PERFORMANCE ON THE BEST EPOCH ...
     model.eval()
@@ -24,6 +25,7 @@ def get_clf_report(model, dataloader, save_dir, class_names):
                 data, labels = batch
                 data = data.type(torch.float).cuda() # rearrange(data, 'B L C -> B C L').type(torch.float).cuda()
                 labels = labels.squeeze().to(torch.int64).cuda()
+
 
             # to the model ...
             logits = model(data)

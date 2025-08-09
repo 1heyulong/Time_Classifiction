@@ -12,13 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import random
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+
 
 from timm.loss import LabelSmoothingCrossEntropy
 from timm.models.layers import DropPath
 from timm.models.layers import trunc_normal_
 from torchmetrics.classification import MulticlassF1Score
 
-from dataloader import get_datasets
+from TSLANetshiyan import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
 from transformers import get_cosine_schedule_with_warmup
 
@@ -233,6 +236,7 @@ class AbnormalAttentionPooling(L.LightningModule):
 
         return x_weighted
 
+
 class TopKPooling(L.LightningModule):
     def __init__(self, in_features, k_ratio=0.2):
         super().__init__()
@@ -356,6 +360,7 @@ class model_pretraining(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.pretrain_lr, weight_decay=1e-4)
+        
         return optimizer
 
     def _calculate_loss(self, batch, mode="train"):
@@ -388,7 +393,7 @@ class model_training(L.LightningModule):
         self.save_hyperparameters()
         self.model = TSLANet()
         self.f1 = MulticlassF1Score(num_classes=args.num_classes)
-        self.criterion = LabelSmoothingCrossEntropy()
+        self.criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
         # 用于储存测试集得预测和真实标签
         self.test_preds = []
         self.test_targets = []
@@ -396,23 +401,58 @@ class model_training(L.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    """
+    第一类直接的不变的优化器
+    """
     # def configure_optimizers(self):
     #     optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
     #     return optimizer
 
+    """
+    第二类使用学习率调度器的优化器
+    """
+    # def configure_optimizers(self):
+    #     optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
 
+    #     # total_steps = len(train_loader) * args.num_epochs
+    #     steps_per_epoch = len(self.trainer.datamodule.train_dataloader())
+    #     total_steps = steps_per_epoch * args.num_epochs
+    #     warmup_steps = int(0.1 * total_steps)
+
+    #     scheduler = get_cosine_schedule_with_warmup(
+    #         optimizer,
+    #         num_warmup_steps=warmup_steps,
+    #         num_training_steps=total_steps
+    #     )
+    #     return {
+    #         "optimizer": optimizer,
+    #         "lr_scheduler": {
+    #             "scheduler": scheduler,
+    #             "interval": "step",
+    #             "frequency": 1
+    #         }
+    #     }
+    """ 
+    第三类使用学习率调度器和监控指标的优化器
+    """
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=1e-4)
-
-        total_steps = len(train_loader) * args.num_epochs
-        warmup_steps = int(0.1 * total_steps)
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
+        optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
+        scheduler = ReduceLROnPlateau(
+            optimizer, 
+            mode='max', 
+            factor=0.5, 
+            patience=50,
+            min_lr=1e-6, 
+            verbose=True
         )
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_f1"  # 监控验证集F1分数
+            }
+        }
+        
 
     def _calculate_loss(self, batch, mode="train"):
         data = batch[0]
@@ -436,6 +476,7 @@ class model_training(L.LightningModule):
             loss_cl_13 = nt_xent_loss(feat1, feat3, temperature=0.5)
             loss_cl_23 = nt_xent_loss(feat2, feat3, temperature=0.5)
             total_loss = loss_cls + args.loss_rate * (loss_cl_13 + loss_cl_23)  # 平衡系数可调
+
 
 
         else:
@@ -554,7 +595,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_id', type=str, default='TEST')
-    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/0627dataset_1/')
+    parser.add_argument('--data_path', type=str, default=r'/hy-tmp/0712_realdata/')
     parser.add_argument('--name', type=str, default='随机测试专用')
     
     # Training parameters:
@@ -567,6 +608,7 @@ if __name__ == '__main__':
     parser.add_argument('--topk_pool', type=str2bool, default=False)
     parser.add_argument('--mstb', type=str2bool, default=False)
 
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
 
     # Model parameters:
     parser.add_argument('--emb_dim', type=int, default=128)
@@ -591,7 +633,7 @@ if __name__ == '__main__':
     print(f"========== {run_description} ===========")
 
 
-    CHECKPOINT_PATH = f"/TSLANet/Classification/store_result/{args.name}"
+    CHECKPOINT_PATH = f"/tf_logs/store_result/{args.name}"
     pretrain_checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
@@ -603,8 +645,9 @@ if __name__ == '__main__':
     checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
-        monitor='val_loss',
-        mode='min'
+        # monitor='val_loss',
+        monitor='val_f1',
+        mode='max'
     )
 
     # Save a copy of this file and configs file as a backup
@@ -634,7 +677,7 @@ if __name__ == '__main__':
     print("F1  results", f1_results)
 
     # append result to a text file...
-    text_save_dir = f"/TSLANet/Classification/0702textFiles_{args.name}"
+    text_save_dir = f"/tf_logs/Classification/0704textFiles"
     os.makedirs(text_save_dir, exist_ok=True)
     f = open(f"{text_save_dir}/{args.model_id}.txt", 'a')
     f.write(run_description + "  \n")

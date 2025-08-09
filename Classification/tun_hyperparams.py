@@ -9,7 +9,7 @@ import numpy as np
 
 # 从您的核心脚本中导入必要的模块
 from shiyanTSLANet_0712_0702_2 import model_training
-from dataloader import get_datasets
+from TSLANetshiyan import get_datasets
 
 def objective(trial, args_cli):
     """
