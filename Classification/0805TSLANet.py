@@ -209,6 +209,43 @@ class TSLANet(L.LightningModule):
         return x
 
 
+class model_pretraining(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = TSLANet()
+
+    def forward(self, x):
+        return self.model(x)
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(), lr=args.pretrain_lr, weight_decay=1e-4)
+        return optimizer
+
+    def _calculate_loss(self, batch, mode="train"):
+        data = batch[0]
+
+        preds, target = self.model.pretrain(data)
+
+        loss = (preds - target) ** 2
+        loss = loss.mean(dim=-1)
+        loss = (loss * self.model.mask).sum() / self.model.mask.sum()
+
+        # Logging for both step and epoch
+        self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self._calculate_loss(batch, mode="train")
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        self._calculate_loss(batch, mode="val")
+
+    def test_step(self, batch, batch_idx):
+        self._calculate_loss(batch, mode="test")
+
+
 class model_training(L.LightningModule):
     def __init__(self):
         super().__init__()
@@ -317,6 +354,30 @@ class model_training(L.LightningModule):
             print("Confusion Matrix:\n", cm)
 
 
+def pretrain_model():
+    PRETRAIN_MAX_EPOCHS = args.pretrain_epochs
+
+    trainer = L.Trainer(
+        default_root_dir=CHECKPOINT_PATH,
+        accelerator="auto",
+        devices=1,
+        num_sanity_val_steps=0,
+        max_epochs=PRETRAIN_MAX_EPOCHS,
+        callbacks=[
+            pretrain_checkpoint_callback,
+            LearningRateMonitor("epoch"),
+            TQDMProgressBar(refresh_rate=500)
+        ],
+    )
+    trainer.logger._log_graph = False  # If True, we plot the computation graph in tensorboard
+    trainer.logger._default_hp_metric = None  # Optional logging argument that we don't need
+
+    L.seed_everything(42)  # To be reproducible
+    model = model_pretraining()
+    trainer.fit(model, train_loader, val_loader)
+
+    return pretrain_checkpoint_callback.best_model_path
+
 
 def train_model(pretrained_model_path):
     # # 创建 TensorBoardLogger
@@ -341,8 +402,10 @@ def train_model(pretrained_model_path):
     trainer.logger._default_hp_metric = None  # Optional logging argument that we don't need
 
     L.seed_everything(42)  # To be reproducible
-
-    model = model_training()
+    if args.load_from_pretrained:
+        model = model_training.load_from_checkpoint(pretrained_model_path)
+    else:
+        model = model_training()
 
     trainer.fit(model, train_loader, val_loader)
 
@@ -370,8 +433,10 @@ if __name__ == '__main__':
     
     # Training parameters:
     parser.add_argument('--num_epochs', type=int, default=500)
+    parser.add_argument('--pretrain_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train_lr', type=float, default=1e-3)
+    parser.add_argument('--pretrain_lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
 
     
@@ -383,6 +448,7 @@ if __name__ == '__main__':
     parser.add_argument('--patch_size', type=int, default=7)
 
     # TSLANet components:
+    parser.add_argument('--load_from_pretrained', type=str2bool, default=False, help='False: without pretraining')
     parser.add_argument('--ICB', type=str2bool, default=True)
     parser.add_argument('--ASB', type=str2bool, default=True)
     parser.add_argument('--adaptive_filter', type=str2bool, default=True)
@@ -430,8 +496,10 @@ if __name__ == '__main__':
     args.seq_len = train_loader.dataset.x_data.shape[-1]
     args.num_channels = train_loader.dataset.x_data.shape[1]
 
-
-    best_model_path = ''
+    if args.load_from_pretrained:
+        best_model_path = pretrain_model()
+    else:
+        best_model_path = ''
 
     model, acc_results, f1_results = train_model(best_model_path)
     print("ACC results", acc_results)

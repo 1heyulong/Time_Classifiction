@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from timm.loss import LabelSmoothingCrossEntropy
 from timm.models.layers import DropPath
 from timm.models.layers import trunc_normal_
-from torchmetrics.classification import MulticlassF1Score
+from torchmetrics.classification import MulticlassF1Score, MulticlassPrecision, MulticlassRecall
 
 from dataloader import get_datasets
 from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3D
@@ -52,7 +52,7 @@ class ICB(L.LightningModule):
 class PatchEmbed(L.LightningModule):
     def __init__(self, seq_len, patch_size=8, in_chans=3, embed_dim=384):
         super().__init__()
-        stride = patch_size // 2
+        stride = patch_size // 3
         num_patches = int((seq_len - patch_size) / stride + 1)
         self.num_patches = num_patches
         self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=patch_size, stride=stride)
@@ -70,55 +70,36 @@ class Adaptive_Spectral_Block(nn.Module):
 
         trunc_normal_(self.complex_weight_high, std=.02)
         trunc_normal_(self.complex_weight, std=.02)
-        self.threshold_param = nn.Parameter(torch.rand(1)) # * 0.5)
+        self.threshold_param = nn.Parameter(torch.rand(1))
 
     def create_adaptive_high_freq_mask(self, x_fft):
         B, _, _ = x_fft.shape
-
-        # Calculate energy in the frequency domain
         energy = torch.abs(x_fft).pow(2).sum(dim=-1)
-
-        # Flatten energy across H and W dimensions and then compute median
-        flat_energy = energy.view(B, -1)  # Flattening H and W into a single dimension
-        median_energy = flat_energy.median(dim=1, keepdim=True)[0]  # Compute median
-        median_energy = median_energy.view(B, 1)  # Reshape to match the original dimensions
-
-        # Normalize energy
-        epsilon = 1e-6  # Small constant to avoid division by zero
+        flat_energy = energy.view(B, -1)
+        median_energy = flat_energy.median(dim=1, keepdim=True)[0]
+        median_energy = median_energy.view(B, 1)
+        epsilon = 1e-6
         normalized_energy = energy / (median_energy + epsilon)
-
         adaptive_mask = ((normalized_energy > self.threshold_param).float() - self.threshold_param).detach() + self.threshold_param
         adaptive_mask = adaptive_mask.unsqueeze(-1)
-
         return adaptive_mask
 
     def forward(self, x_in):
         B, N, C = x_in.shape
-
         dtype = x_in.dtype
         x = x_in.to(torch.float32)
-
-        # Apply FFT along the time dimension
         x_fft = torch.fft.rfft(x, dim=1, norm='ortho')
         weight = torch.view_as_complex(self.complex_weight)
         x_weighted = x_fft * weight
-
         if args.adaptive_filter:
-            # Adaptive High Frequency Mask (no need for dimensional adjustments)
             freq_mask = self.create_adaptive_high_freq_mask(x_fft)
             x_masked = x_fft * freq_mask.to(x.device)
-
             weight_high = torch.view_as_complex(self.complex_weight_high)
             x_weighted2 = x_masked * weight_high
-
             x_weighted += x_weighted2
-
-        # Apply Inverse FFT
         x = torch.fft.irfft(x_weighted, n=N, dim=1, norm='ortho')
-
         x = x.to(dtype)
-        x = x.view(B, N, C)  # Reshape back to original shape
-
+        x = x.view(B, N, C)
         return x
 
 
@@ -167,8 +148,14 @@ class TSLANet(L.LightningModule):
             for i in range(args.depth)]
         )
 
-        # Classifier head
-        self.head = nn.Linear(args.emb_dim, args.num_classes)
+        self.pre_head_norm = nn.LayerNorm(args.emb_dim)
+        self.head = nn.Sequential(
+            nn.Dropout(p=max(0.2, args.dropout_rate)),
+            nn.Linear(args.emb_dim, args.num_classes)
+        )
+
+        # # Classifier head
+        # self.head = nn.Linear(args.emb_dim, args.num_classes)
 
         # init weights
         trunc_normal_(self.pos_embed, std=.02)
@@ -205,6 +192,7 @@ class TSLANet(L.LightningModule):
             x = tsla_blk(x)
 
         x = x.mean(1)
+        x = self.pre_head_norm(x)
         x = self.head(x)
         return x
 
@@ -214,8 +202,12 @@ class model_training(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = TSLANet()
-        self.f1 = MulticlassF1Score(num_classes=args.num_classes)
-        self.criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+        self.f1 = MulticlassF1Score(num_classes=args.num_classes, average="macro")
+        self.precision = MulticlassPrecision(num_classes=args.num_classes, average="macro")
+        self.recall = MulticlassRecall(num_classes=args.num_classes, average="macro")
+
+        self.register_buffer("ce_weights", torch.tensor(class_weights, dtype=torch.float32))
+        self.criterion = nn.CrossEntropyLoss(weight=self.ce_weights)
         # 用于储存测试集得预测和真实标签
         self.test_preds = []
         self.test_targets = []
@@ -223,62 +215,57 @@ class model_training(L.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    # def configure_optimizers(self):
+    #     optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
+    #     scheduler = ReduceLROnPlateau(
+    #         optimizer, 
+    #         mode='min', 
+    #         factor=0.5, 
+    #         patience=10, 
+    #         verbose=True
+    #     )
+    #     return {
+    #         "optimizer": optimizer,
+    #         "lr_scheduler": {
+    #             "scheduler": scheduler,
+    #             "monitor": "val_loss"  # 监控验证集损失
+    #         }
+    #     }
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=args.train_lr, weight_decay=args.weight_decay)
-        scheduler = ReduceLROnPlateau(
-            optimizer, 
-            mode='min', 
-            factor=0.5, 
-            patience=100, 
-            verbose=True
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=20, T_mult=2, eta_min=1e-6  # T_0=首次周期长度(epochs)，T_mult=周期倍增
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_total_loss"  # 监控验证集损失
+                "interval": "epoch"  # 每个 epoch 调整
             }
         }
 
 
+
     def _calculate_loss(self, batch, mode="train"):
-        data = batch[0]
+        data = batch[0]  # expected [B, C, T]
         labels = batch[1].to(torch.int64)
 
         preds = self.model.forward(data)
         
-        # 计算正类和反类的损失
-        positive_mask = (labels == 1)#1是数据量少的类
-        negative_mask = (labels == 0)#0是数据量多的类
-
-        positive_loss = self.criterion(preds[positive_mask], labels[positive_mask]) if positive_mask.any() else torch.tensor(0.0, device=preds.device)
-        negative_loss = self.criterion(preds[negative_mask], labels[negative_mask]) if negative_mask.any() else torch.tensor(0.0, device=preds.device)
-
-        # 按照比重计算总损失
-        positive_weight = positive_mask.float().mean().item()  # 正类在数据中的比例
-        negative_weight = negative_mask.float().mean().item()  # 反类在数据中的比例
-
-        # total_loss = negative_weight * positive_loss + positive_weight * negative_loss
-        total_loss = 0.9 * positive_loss + 0.1 * negative_loss
-
-        # 准确率和 F1 分数
-        acc = (preds.argmax(dim=-1) == labels).float().mean()
+        loss = self.criterion(preds, labels)
         f1 = self.f1(preds, labels)
+        prec = self.precision(preds, labels)
+        rec = self.recall(preds, labels)
 
-        # Logging for both step and epoch
-        self.log(f"{mode}_total_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_positive_loss", positive_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log(f"{mode}_negative_loss", negative_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        # self.log(f"{mode}_acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-
+        self.log(f"{mode}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log(f"{mode}_f1", f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
+        self.log(f"{mode}_precision", prec, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log(f"{mode}_recall", rec, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+
         if mode == "test":
             self.test_preds.append(preds.argmax(dim=-1).cpu())
             self.test_targets.append(labels.cpu())
-            
-        return total_loss
+        return loss
 
     # def _calculate_loss(self, batch, mode="train"):
     #     data = batch[0]
@@ -320,8 +307,10 @@ class model_training(L.LightningModule):
             print("Confusion Matrix:\n", cm)
 
 
+from lightning.pytorch.callbacks import EarlyStopping, StochasticWeightAveraging
+swa = StochasticWeightAveraging(swa_lrs=1e-4)
 
-def train_model(pretrained_model_path):
+def train_model():
     # # 创建 TensorBoardLogger
     # tensorboard_logger = TensorBoardLogger(
     #     save_dir=args.checkpoints,  # 日志保存路径
@@ -337,7 +326,8 @@ def train_model(pretrained_model_path):
         callbacks=[
             checkpoint_callback,
             LearningRateMonitor("epoch"),
-            TQDMProgressBar(refresh_rate=500)
+            TQDMProgressBar(refresh_rate=500),
+            swa
         ],
     )
     trainer.logger._log_graph = False  # If True, we plot the computation graph in tensorboard
@@ -356,12 +346,15 @@ def train_model(pretrained_model_path):
     val_result = trainer.test(model, dataloaders=val_loader, verbose=False)
     test_result = trainer.test(model, dataloaders=test_loader, verbose=False)
 
-    acc_result = {"test": test_result[0]["test_acc"], "val": val_result[0]["test_acc"]}
+    # acc_result = {"test": test_result[0]["test_acc"], "val": val_result[0]["test_acc"]}
     f1_result = {"test": test_result[0]["test_f1"], "val": val_result[0]["test_f1"]}
+    prec_result = {"test": test_result[0].get("test_precision"), "val": val_result[0].get("test_precision")}
+    recall_result = {"test": test_result[0].get("test_recall"), "val": val_result[0].get("test_recall")}
+
 
     get_clf_report(model, test_loader, CHECKPOINT_PATH, args.class_names)
 
-    return model, acc_result, f1_result
+    return model, f1_result, prec_result, recall_result
 
 
 if __name__ == '__main__':
@@ -375,7 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train_lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--weight_decay', type=float, default=5e-3)
 
     
     # Model parameters:
@@ -400,19 +393,19 @@ if __name__ == '__main__':
     print(f"========== {run_description} ===========")
 
 
-    CHECKPOINT_PATH = f"/tf_logs/0807_store_result/{args.name}"
+    CHECKPOINT_PATH = f"/tf_logs/{args.name}"
     pretrain_checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
         filename='pretrain-{epoch}',
-        monitor='val_total_loss',
+        monitor='val_loss',
         mode='min'
     )
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=CHECKPOINT_PATH,
         save_top_k=1,
-        monitor='val_total_loss',
+        monitor='val_loss',
         mode='min'
     )
 
@@ -433,12 +426,17 @@ if __name__ == '__main__':
     args.seq_len = train_loader.dataset.x_data.shape[-1]
     args.num_channels = train_loader.dataset.x_data.shape[1]
 
+    class_counts = np.bincount(train_loader.dataset.y_data)
+    num_samples = len(train_loader.dataset.y_data)
+    # 反频率权重: w_c = N / (2 * N_c)
+    class_weights = num_samples / (2.0 * class_counts + 1e-8)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
-    best_model_path = ''
 
-    model, acc_results, f1_results = train_model(best_model_path)
-    print("ACC results", acc_results)
-    print("F1  results", f1_results)
+    model, f1_result, prec_result, recall_result = train_model()
+    print("F1  results", f1_result)
+    print("Precision results", prec_result)
+    print("Recall results", recall_result)
 
     # append result to a text file...
     text_save_dir = "/tf_logs/textFiles/"
@@ -446,7 +444,7 @@ if __name__ == '__main__':
     f = open(f"{text_save_dir}/{args.model_id}.txt", 'a')
     f.write(run_description + "  \n")
     f.write(f"TSLANet_{os.path.basename(args.data_path)}_l_{args.depth}" + "  \n")
-    f.write('acc:{}, mf1:{}'.format(acc_results, f1_results))
+    f.write('mf1:{}, prec:{}, rec:{}'.format(f1_result, prec_result, recall_result))
     f.write('\n')
     f.write('\n')
     f.close()
