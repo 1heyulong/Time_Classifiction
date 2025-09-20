@@ -24,6 +24,9 @@ from utils import get_clf_report, save_copy_of_files, str2bool, random_masking_3
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 
 
+
+
+
 class ICB(L.LightningModule):
     def __init__(self, in_features, hidden_features, drop=0.):
         super().__init__()
@@ -34,21 +37,13 @@ class ICB(L.LightningModule):
         self.act = nn.GELU()
 
     def forward(self, x):
+        # x: [B, N, D] -> conv1d expects [B, D, N]
         x = x.transpose(1, 2)
-        x1 = self.conv1(x)
-        x1_1 = self.act(x1)
-        x1_2 = self.drop(x1_1)
+        x1 = self.drop(self.act(self.conv1(x)))
+        x2 = self.drop(self.act(self.conv2(x)))
+        out = self.conv3(x1 * x2 + x2 * x1)
+        return out.transpose(1, 2)  # [B, N, D]
 
-        x2 = self.conv2(x)
-        x2_1 = self.act(x2)
-        x2_2 = self.drop(x2_1)
-
-        out1 = x1 * x2_2
-        out2 = x2 * x1_2
-
-        x = self.conv3(out1 + out2)
-        x = x.transpose(1, 2)
-        return x
 
 # 滑动时间序列分割工具
 def Sliding_window(x, window_size, step_size):
